@@ -1,5 +1,9 @@
 #include "ex2.h"
 
+#define NUM_OF_STREAMS 64
+#define NUM_OF_THREADS 1024
+#define N_IMAGES 10000
+
 __device__ void prefix_sum(int arr[], int arr_size) {
     int tid = threadIdx.x;
     int increment;
@@ -57,14 +61,22 @@ private:
     uchar *dimg_in;
     uchar *dimg_out;
     int last_img_id;
+    cudaStream_t* streams;
+    int* img_ids;
 
 public:
     streams_server()
     {
         // TODO initialize context (memory buffers, streams, etc...)
-        CUDA_CHECK( cudaMalloc(&dimg_in, IMG_WIDTH * IMG_HEIGHT) );
-        CUDA_CHECK( cudaMalloc(&dimg_out, IMG_WIDTH * IMG_HEIGHT) );
+    	CUDA_CHECK( cudaHostAlloc(&streams, NUM_OF_STREAMS*sizeof(cudaStream_t),0));
+    	CUDA_CHECK( cudaHostAlloc(&img_ids, NUM_OF_STREAMS*sizeof(int),0));
+        CUDA_CHECK( cudaMalloc(&dimg_in,N_IMAGES*IMG_WIDTH * IMG_HEIGHT) );
+        CUDA_CHECK( cudaMalloc(&dimg_out, N_IMAGES*IMG_WIDTH * IMG_HEIGHT) );
         last_img_id = -1;
+        for (int i = 0; i < NUM_OF_STREAMS; i++){
+        	 CUDA_CHECK(cudaStreamCreate(&streams[i]));
+             img_ids[i] = -1;
+        }
     }
 
     ~streams_server() override
@@ -72,19 +84,33 @@ public:
         // TODO free resources allocated in constructor
         CUDA_CHECK( cudaFree(dimg_in) );
         CUDA_CHECK( cudaFree(dimg_out) );
+        for (int i = 0; i < NUM_OF_STREAMS; i++)
+        	 CUDA_CHECK(cudaStreamDestroy(streams[i]));
+        CUDA_CHECK(cudaFreeHost(streams));
+        CUDA_CHECK(cudaFreeHost(img_ids));
     }
 
     bool enqueue(int img_id, uchar *img_in, uchar *img_out) override
     {
         // TODO place memory transfers and kernel invocation in streams if possible.
 
-        if (last_img_id != -1)
-            return false;
+      //  if (last_img_id != -1)
+       //     return false;
+        int i =0;
+        bool available_stream = false;
+        for (;i<NUM_OF_STREAMS;i++){
+        	if (img_ids[i]==-1){
+        		available_stream = true;
+        		break;
+        	}
+        }
+        if (!available_stream) return false;
 
-        CUDA_CHECK( cudaMemcpyAsync(dimg_in, img_in, IMG_WIDTH * IMG_HEIGHT, cudaMemcpyHostToDevice ));
-        process_image_kernel<<<1, 1024>>>(dimg_in, dimg_out);
-        CUDA_CHECK( cudaMemcpyAsync(img_out, dimg_out, IMG_WIDTH * IMG_HEIGHT, cudaMemcpyDeviceToHost ));
-        last_img_id = img_id;
+        CUDA_CHECK( cudaMemcpyAsync(dimg_in + img_id*IMG_WIDTH * IMG_HEIGHT, img_in, IMG_WIDTH * IMG_HEIGHT, cudaMemcpyHostToDevice, streams[i]));
+        process_image_kernel<<<1, 1024, 0, streams[i]>>>(dimg_in + img_id*IMG_WIDTH * IMG_HEIGHT, dimg_out + img_id*IMG_WIDTH * IMG_HEIGHT);
+        CUDA_CHECK( cudaMemcpyAsync(img_out, dimg_out + img_id*IMG_WIDTH * IMG_HEIGHT, IMG_WIDTH * IMG_HEIGHT, cudaMemcpyDeviceToHost, streams[i]));
+      //  last_img_id = img_id;
+        img_ids[i] = img_id;
         return true;
     }
 
@@ -92,21 +118,25 @@ public:
     {
         // TODO query (don't block) streams for any completed requests.
 
-        if (last_img_id < 0)
-            return false;
-
-        cudaError_t status = cudaStreamQuery(0);
-        switch (status) {
-        case cudaSuccess:
-            *img_id = last_img_id; // TODO return the img_id of the request that was completed.
-            last_img_id = -1;
-            return true;
-        case cudaErrorNotReady:
-            return false;
-        default:
-            CUDA_CHECK(status);
-            return false;
+  //      if (last_img_id < 0)
+    //        return false;
+        for (int strm = 0; strm<NUM_OF_STREAMS; strm++){
+        	if (img_ids[strm]==-1) continue;
+			cudaError_t status = cudaStreamQuery(streams[strm]);
+			switch (status) {
+			case cudaSuccess:
+				*img_id = img_ids[strm];
+				img_ids[strm] = -1;
+		//		last_img_id = -1;
+				return true;
+			case cudaErrorNotReady:
+				continue;
+			default:
+				CUDA_CHECK(status);
+				continue;
+			}
         }
+        return false;
     }
 };
 
