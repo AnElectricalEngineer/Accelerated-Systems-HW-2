@@ -186,10 +186,40 @@ public:
 	}
 };
 
+
+
+
+__global__ void process_image_queue_kernel(	queue** cpu_to_gpu, queue** gpu_to_cpu){
+	__shared__ uchar* img_in;
+	__shared__ uchar* img_out;
+
+	int thread_id = threadIdx.x;
+	int block_id  =  blockIdx.x;
+
+
+	while (true) {
+		if (!thread_id){
+			gpu_task task = cpu_to_gpu[block_id]->pop();
+			img_in = task._img_in;
+			img_out = task._img_out;
+		}
+
+		_syncthreads();
+        process_image_kernel(img_in, img_out);
+        _syncthreads();
+
+		if (!thread_id){
+			img_id = task._img_id;
+			cpu_to_gpu[block_id]->push(gpu_task(img_id, img_in, img_out));
+		}
+		_syncthreads();
+	}
+}
+
+
 class queue_server : public image_processing_server
 {
 private:
-    // TODO define queue server context (memory buffers, etc...)
 	queue** cpu_to_gpu;
 	queue** gpu_to_cpu;
 	int num_of_blocks;
@@ -198,8 +228,6 @@ private:
 public:
     queue_server(int threads)
     {
-        // TODO initialize host state
-        // TODO launch GPU producer-consumer kernel with given number of threads
     	cudaDeviceProp gpu_prop;
     	cudaGetDeviceProperties(&gpu_prop, 0);
     	size_t max_threads_per_core = gpu_prop.maxThreadsPerMultiProcessor;
@@ -218,15 +246,24 @@ public:
     	if (num_of_blocks > num_of_cores * (size_t)(regs_per_core / (threads * REG_PER_THREAD)))
     		num_of_blocks = num_of_cores * (size_t)(regs_per_core / (threads * REG_PER_THREAD));
 
+    	CUDA_CHECK(cudaMallocHost(&cpu_to_gpu, num_of_blocks * sizeof(queue*)));
+    	CUDA_CHECK(cudaMallocHost(&gpu_to_cpu, num_of_blocks * sizeof(queue*)));
 
+    	for (int i =0; i< num_of_blocks;i++){
+        	::new(cpu_to_gpu + i) queue()*;
+        	::new(gpu_to_cpu + i) queue()*;
+        	CUDA_CHECK(cudaMallocHost((cpu_to_gpu + i), sizeof(queue)));
+        	CUDA_CHECK(cudaMallocHost((gpu_to_cpu + i), sizeof(queue)));
+        	::new(*(cpu_to_gpu + i)) queue();
+        	::new(*(gpu_to_cpu + i)) queue();
+    	}
 
-
-
+    	process_image_queue_kernel<<<num_of_blocks, threads>>>(cpu_to_gpu, gpu_to_cpu);
     }
 
     ~queue_server() override
     {
-        // TODO free resources allocated in constructor
+
     }
 
     bool enqueue(int img_id, uchar *img_in, uchar *img_out) override
