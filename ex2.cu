@@ -1,4 +1,5 @@
 #include "ex2.h"
+#include <cuda/atomic>
 
 #define NUM_OF_STREAMS 64
 #define NUM_OF_THREADS 1024
@@ -23,7 +24,7 @@ __device__ void prefix_sum(int arr[], int arr_size) {
 
 // Example single-threadblock kernel for processing a single image.
 // Feel free to change it.
-__global__ void process_image_kernel(uchar *in, uchar *out) {
+__device__ void process_image_kernel(uchar *in, uchar *out) {
     __shared__ int histogram[256];
     __shared__ uchar map[256];
 
@@ -51,6 +52,10 @@ __global__ void process_image_kernel(uchar *in, uchar *out) {
     for (int i = tid; i < IMG_WIDTH * IMG_HEIGHT; i += blockDim.x) {
         out[i] = map[in[i]];
     }
+}
+
+__global__ void process_image_kernel_streams(uchar *in, uchar *out) {
+	process_image_kernel(in, out);
 }
 
 class streams_server : public image_processing_server
@@ -108,7 +113,7 @@ public:
         if (!available_stream) return false;
 
         CUDA_CHECK( cudaMemcpyAsync(dimg_in + img_id*IMG_WIDTH * IMG_HEIGHT, img_in, IMG_WIDTH * IMG_HEIGHT, cudaMemcpyHostToDevice, streams[i]));
-        process_image_kernel<<<1, 1024, 0, streams[i]>>>(dimg_in + img_id*IMG_WIDTH * IMG_HEIGHT, dimg_out + img_id*IMG_WIDTH * IMG_HEIGHT);
+        process_image_kernel_streams<<<1, 1024, 0, streams[i]>>>(dimg_in + img_id*IMG_WIDTH * IMG_HEIGHT, dimg_out + img_id*IMG_WIDTH * IMG_HEIGHT);
         CUDA_CHECK( cudaMemcpyAsync(img_out, dimg_out + img_id*IMG_WIDTH * IMG_HEIGHT, IMG_WIDTH * IMG_HEIGHT, cudaMemcpyDeviceToHost, streams[i]));
       //  last_img_id = img_id;
         img_ids[i] = img_id;
@@ -147,24 +152,27 @@ std::unique_ptr<image_processing_server> create_streams_server()
 }
 
 //////////////////////////***************************///////////////////////////////
-#define TASKS_PER_QUEUE 16
-#define SHARED_MEM_PER_THREAD_BLOCK 1500
+#define SHARED_MEM_PER_THREAD_BLOCK 1304
 #define REG_PER_THREAD 32
 
 class gpu_task{
 public:
 	int    _img_id;
-	uchar *_img_in;
-	uchar *_img_out;
+	uchar* _img_in;
+	uchar* _img_out;
 
 	__host__ __device__ gpu_task(int img_id, uchar *img_in, uchar *img_out) :
 	                	_img_id(img_id), _img_in(img_in), _img_out(img_out){}
+
+	__host__ __device__ gpu_task() :
+	                	_img_id(-1), _img_in(nullptr), _img_out(nullptr){}
 };
 
 
 
 
 class queue{
+	static const size_t TASKS_PER_QUEUE = 16;
 	gpu_task _tasks[TASKS_PER_QUEUE];
 	cuda::atomic<size_t, cuda::thread_scope_system>  _head;
 	cuda::atomic<size_t, cuda::thread_scope_system>  _tail;
@@ -173,14 +181,14 @@ public:
 	queue(): _head(0), _tail(0){}
 
 	__host__ __device__ void push(gpu_task task){
-		int tail = _tail.load(cuda::memory_order_relaxed);
+		size_t tail = _tail.load(cuda::memory_order_relaxed);
 		while ((tail - _head.load(cuda::memory_order_acquire)) == TASKS_PER_QUEUE);
 		_tasks[_tail % TASKS_PER_QUEUE] = task;
 		_tail.store(tail+1, cuda::memory_order_release);
 	}
 
 	__host__ __device__ gpu_task pop(){
-		int head = _head.load(cuda::memory_order_relaxed);
+		size_t head = _head.load(cuda::memory_order_relaxed);
 		while (head == _tail.load(cuda::memory_order_acquire));
 		gpu_task task = _tasks[ head % TASKS_PER_QUEUE];
 		_head.store(head+1, cuda::memory_order_release);
@@ -188,15 +196,15 @@ public:
 	}
 
 	__host__ __device__ bool is_queue_empty(){
-		int head = _head.load(cuda::memory_order_relaxed);
+		size_t head = _head.load(cuda::memory_order_relaxed);
 		if (head == _tail.load(cuda::memory_order_acquire))
 				return true;
 		return false;
 	}
 
 	__host__ __device__ bool is_queue_full(){
-		int tail = _head.tail(cuda::memory_order_relaxed);
-		if ((tail - head.load(cuda::memory_order_acquire)) == TASKS_PER_QUEUE)
+		size_t tail = _tail.load(cuda::memory_order_relaxed);
+		if ((tail - _head.load(cuda::memory_order_acquire)) == TASKS_PER_QUEUE)
 				return true;
 		return false;
 	}
@@ -209,6 +217,7 @@ public:
 __global__ void process_image_queue_kernel(	queue** cpu_to_gpu, queue** gpu_to_cpu, cuda::atomic<bool>* running){
 	__shared__ uchar* img_in;
 	__shared__ uchar* img_out;
+	__shared__ int img_id;
 	__shared__ bool get_out;
 
 	int thread_id = threadIdx.x;
@@ -216,7 +225,7 @@ __global__ void process_image_queue_kernel(	queue** cpu_to_gpu, queue** gpu_to_c
 	if (!thread_id){
 		get_out= false;
 	}
-
+	__syncthreads();
 
 	while (true) {
 		if (!thread_id){
@@ -227,20 +236,20 @@ __global__ void process_image_queue_kernel(	queue** cpu_to_gpu, queue** gpu_to_c
 				gpu_task task = cpu_to_gpu[block_id]->pop();
 				img_in = task._img_in;
 				img_out = task._img_out;
+				img_id = task._img_id;
 			}
 		}
-		_syncthreads();
+		 __syncthreads();
 		if (get_out){
 			break;
 		}
         process_image_kernel(img_in, img_out);
-        _syncthreads();
+        __syncthreads();
 
 		if (!thread_id){
-			img_id = task._img_id;
 			cpu_to_gpu[block_id]->push(gpu_task(img_id, img_in, img_out));
 		}
-		_syncthreads();
+		 __syncthreads();
 	}
 }
 
@@ -259,28 +268,30 @@ public:
     {
     	cudaDeviceProp gpu_prop;
     	cudaGetDeviceProperties(&gpu_prop, 0);
-    	size_t max_threads_per_core = gpu_prop.maxThreadsPerMultiProcessor;
-    	size_t num_of_cores =  gpu_prop.multiProcessorCount;
-    	size_t num_of_blocks = (num_of_cores * max_threads_per_core) /  threads;
-    	size_t shared_mem_per_core = gpu_prop.sharedMemPerMultiprocessor;
-    	size_t regs_per_core = gpu_prop.regsPerMultiprocessor;
-    	size_t max_blocks_per_core = gpu_prop.maxBlockPerMultiProcessor;
+    	int max_threads_per_core = gpu_prop.maxThreadsPerMultiProcessor;
+    	int num_of_cores =  gpu_prop.multiProcessorCount;
+    	num_of_blocks = (num_of_cores * max_threads_per_core) /  threads;
+    	int shared_mem_per_core = gpu_prop.sharedMemPerMultiprocessor;
+    	int regs_per_core = gpu_prop.regsPerMultiprocessor;
+    	//size_t max_blocks_per_core = gpu_prop.maxBlocksPerMultiProcessor;
 
-    	if(num_of_blocks >  num_of_cores * max_blocks_per_core)
-    		num_of_blocks = num_of_cores * max_blocks_per_core;
+    /*	if(num_of_blocks >  num_of_cores * max_blocks_per_core)
+    		num_of_blocks = num_of_cores * max_blocks_per_core;*/
 
-    	if (num_of_blocks > num_of_cores * (size_t)(shared_mem_per_core / SHARED_MEM_PER_THREAD_BLOCK))
-    		num_of_blocks = num_of_cores * (size_t)(shared_mem_per_core / SHARED_MEM_PER_THREAD_BLOCK);
+    	if (num_of_blocks > num_of_cores * (int)(shared_mem_per_core / SHARED_MEM_PER_THREAD_BLOCK))
+    		num_of_blocks = num_of_cores * (int)(shared_mem_per_core / SHARED_MEM_PER_THREAD_BLOCK);
 
-    	if (num_of_blocks > num_of_cores * (size_t)(regs_per_core / (threads * REG_PER_THREAD)))
-    		num_of_blocks = num_of_cores * (size_t)(regs_per_core / (threads * REG_PER_THREAD));
+    	if (num_of_blocks > num_of_cores * (int)(regs_per_core / (threads * REG_PER_THREAD)))
+    		num_of_blocks = num_of_cores * (int)(regs_per_core / (threads * REG_PER_THREAD));
 
     	CUDA_CHECK(cudaMallocHost(&cpu_to_gpu, num_of_blocks * sizeof(queue*)));
     	CUDA_CHECK(cudaMallocHost(&gpu_to_cpu, num_of_blocks * sizeof(queue*)));
-    	::new(cpu_to_gpu) queue*();
-    	::new(gpu_to_cpu) queue*();
+    //	::new(cpu_to_gpu) queue*();
+   // 	::new(gpu_to_cpu) queue*();
 
     	for (int i =0; i< num_of_blocks;i++){
+        	::new(cpu_to_gpu+i) queue*();
+        	::new(gpu_to_cpu+i) queue*();
         	CUDA_CHECK(cudaMallocHost((cpu_to_gpu + i), sizeof(queue)));
         	CUDA_CHECK(cudaMallocHost((gpu_to_cpu + i), sizeof(queue)));
         	::new(*(cpu_to_gpu + i)) queue();
@@ -296,20 +307,20 @@ public:
     {
 
     	running->store(0, cuda::memory_order_release);
-    	CHECK_CUDA(cudaDeviceSynchronize());
+    	CUDA_CHECK(cudaDeviceSynchronize());
 
     	for (int i =0; i< num_of_blocks;i++){
-        	*(cpu_to_gpu + i)-> ~queue();
-        	*(gpu_to_cpu + i)-> ~queue();
-        	CUDA_CHECK(cudaFreeHost(*(cpu_to_gpu + i)));
-        	CUDA_CHECK(cudaFreeHost(*(gpu_to_cpu + i)));
+        	cpu_to_gpu[i]-> ~queue();
+        	gpu_to_cpu[i]-> ~queue();
+        	CUDA_CHECK(cudaFreeHost(cpu_to_gpu[i]));
+        	CUDA_CHECK(cudaFreeHost(gpu_to_cpu[i]));
     	}
 
-    	cpu_to_gpu-> ~queue*();
-    	gpu_to_cpu-> ~queue*();
+    //	cpu_to_gpu-> ~queue*();
+    	//gpu_to_cpu-> ~queue*();
     	running->~atomic<bool>();
-    	CUDA_CHECK(cudaFreeHost(cpu_to_gpu, num_of_blocks * sizeof(queue*)));
-    	CUDA_CHECK(cudaFreeHost(gpu_to_cpu, num_of_blocks * sizeof(queue*)));
+    	CUDA_CHECK(cudaFreeHost(cpu_to_gpu));
+    	CUDA_CHECK(cudaFreeHost(gpu_to_cpu));
     	CUDA_CHECK(cudaFreeHost(running));
     }
 
@@ -332,7 +343,7 @@ public:
     			continue;
 
     		gpu_task task = gpu_to_cpu[i]->pop();
-    		*img_id = task.img_id;
+    		*img_id = task._img_id;
     		return true;
     	}
         return false;
