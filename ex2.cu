@@ -182,7 +182,9 @@ public:
 
 	__host__ __device__ void push(gpu_task task){
 		size_t tail = _tail.load(cuda::memory_order_relaxed);
+		//printf("#########17###############");
 		while ((tail - _head.load(cuda::memory_order_acquire)) == TASKS_PER_QUEUE);
+		//printf("#########18###############");
 		_tasks[_tail % TASKS_PER_QUEUE] = task;
 		_tail.store(tail+1, cuda::memory_order_release);
 	}
@@ -229,11 +231,20 @@ __global__ void process_image_queue_kernel(	queue** cpu_to_gpu, queue** gpu_to_c
 
 	while (true) {
 		if (!thread_id){
-			if (cpu_to_gpu[block_id]->is_queue_empty() && !(running->load(cuda::memory_order_acquire))) {
+			bool run = running->load(cuda::memory_order_acquire);
+			bool empty = cpu_to_gpu[block_id]->is_queue_empty();
+		    printf("#########runnnn: %d###############\n",run);
+			printf("#########empty: %d###############\n",empty);
+			if ( empty && !(run)) {
+				printf("#########5###############");
 				get_out=true;
+				running->store(true,cuda::memory_order_release);
+				//printf("#########6###############");
 			}
 			else{
+				//printf("#########7###############");
 				gpu_task task = cpu_to_gpu[block_id]->pop();
+				//printf("#########8###############");
 				img_in = task._img_in;
 				img_out = task._img_out;
 				img_id = task._img_id;
@@ -241,13 +252,19 @@ __global__ void process_image_queue_kernel(	queue** cpu_to_gpu, queue** gpu_to_c
 		}
 		 __syncthreads();
 		if (get_out){
-			break;
+			printf("#########9###############");
+			return;
 		}
+
         process_image_kernel(img_in, img_out);
+        //printf("#########10###############");
         __syncthreads();
 
 		if (!thread_id){
-			cpu_to_gpu[block_id]->push(gpu_task(img_id, img_in, img_out));
+			//printf("#########11###############");
+			gpu_to_cpu[block_id]->push(gpu_task(img_id, img_in, img_out));
+			//printf("#########12###############");
+
 		}
 		 __syncthreads();
 	}
@@ -299,15 +316,20 @@ public:
     	}
     	CUDA_CHECK(cudaMallocHost(&running, sizeof(cuda::atomic<bool>)));
     	::new(running) cuda::atomic<bool>(true);
-
-    	process_image_queue_kernel<<<num_of_blocks, threads>>>(cpu_to_gpu, gpu_to_cpu, running);
+    	printf("#########num_of_blocks: %d###############",num_of_blocks);
+    	//process_image_queue_kernel<<<num_of_blocks, threads>>>(cpu_to_gpu, gpu_to_cpu, running);
+    	process_image_queue_kernel<<<1, 1>>>(cpu_to_gpu, gpu_to_cpu, running);
+    	//printf("#########15###############");
     }
 
     ~queue_server() override
     {
+    	printf("#########1###############");
 
-    	running->store(0, cuda::memory_order_release);
+    	running->exchange(false, cuda::memory_order_acq_rel);
+    	printf("#########4###############");
     	CUDA_CHECK(cudaDeviceSynchronize());
+    	printf("#########2###############");
 
     	for (int i =0; i< num_of_blocks;i++){
         	cpu_to_gpu[i]-> ~queue();
@@ -316,9 +338,10 @@ public:
         	CUDA_CHECK(cudaFreeHost(gpu_to_cpu[i]));
     	}
 
-    //	cpu_to_gpu-> ~queue*();
+        //cpu_to_gpu-> ~queue*();
     	//gpu_to_cpu-> ~queue*();
     	running->~atomic<bool>();
+    	printf("#########a###############");
     	CUDA_CHECK(cudaFreeHost(cpu_to_gpu));
     	CUDA_CHECK(cudaFreeHost(gpu_to_cpu));
     	CUDA_CHECK(cudaFreeHost(running));
@@ -344,6 +367,7 @@ public:
 
     		gpu_task task = gpu_to_cpu[i]->pop();
     		*img_id = task._img_id;
+    		//printf("#########3###############");
     		return true;
     	}
         return false;
